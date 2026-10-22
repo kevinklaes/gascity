@@ -2501,7 +2501,7 @@ func startOneCity(
 		cs.startBeadEventWatcher(cityCtx)
 		cs.startAutocloseSweep(cityCtx)
 		cs.startOpSweep(cityCtx)
-		cs.startConversationLaneHost(cityCtx)
+		cs.startConversationLaneHost(cityCtx, wiring.mode)
 		cs.startMaintenanceLoop(cityCtx)
 		return nil
 	})
