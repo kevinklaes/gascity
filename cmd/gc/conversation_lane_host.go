@@ -268,6 +268,8 @@ type conversationLaneHost struct {
 	// controller's latched mode's (laneStopReading). It is fixed at
 	// construction, so the first pass already reads by it.
 	stopReading session.StopRequestReading
+	// interrupts records the interrupt each conversation's executor runs.
+	interrupts *laneInterrupts
 	// turnHandle resolves a conversation's turn handle for its observer
 	// (conversation_lane_turns.go); production builds the session's worker
 	// handle.
@@ -371,6 +373,7 @@ func newConversationLaneHost(env laneHostEnv, kinds []string, reading session.St
 		newExec: func(deps laneExecDeps, row laneRow) opjournal.Executor {
 			return newConversationLaneExec(deps, row)
 		},
+		interrupts:   newLaneInterrupts(),
 		logf:         log.Printf,
 		observerName: laneObserverName(),
 		workers:      map[string]*laneWorker{},
@@ -770,13 +773,14 @@ func (h *conversationLaneHost) pass(conv string) (out lanePassOutcome) {
 		h.logf("conversation-lanes: conversation %s has no session row on two reads; its open ops close as skipped{conversation_closed}", conv)
 	}
 	exec := h.newExec(laneExecDeps{
-		cityPath: h.env.CityPath(),
-		cfg:      h.env.Config(),
-		sessions: sessions,
-		sp:       h.env.SessionProvider(),
-		lane:     st,
-		clk:      h.clk,
-		note:     h.noteError,
+		cityPath:   h.env.CityPath(),
+		cfg:        h.env.Config(),
+		sessions:   sessions,
+		sp:         h.env.SessionProvider(),
+		lane:       st,
+		clk:        h.clk,
+		note:       h.noteError,
+		interrupts: h.interrupts,
 	}, row)
 	res, err := lane.Pass(h.ctx, view, exec)
 	h.notePass(conv, res, err)
