@@ -97,3 +97,7 @@ __pycache__/
 
 # Machine-local bazel config (remote executor endpoints, mTLS paths)
 .bazelrc.local
+
+# Gas City
+.beads/*
+!.beads/identity.toml
