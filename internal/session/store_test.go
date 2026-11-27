@@ -761,3 +761,60 @@ func TestUpdateMetadataInfoFailedWritePersistsNothingAndReturnsInputUnchanged(t 
 		}
 	}
 }
+
+// TestMarkersReadsOnlyTheRequestedKeys proves the read half of SetMarker: the
+// requested keys come back verbatim under the canonical id, a key the row does
+// not carry reads as empty, and no other metadata leaves the front door.
+func TestMarkersReadsOnlyTheRequestedKeys(t *testing.T) {
+	is, rec := recordingStore(t, sessionBeadFixture("s-1", "open", map[string]string{
+		"marker_a": "one",
+		"marker_b": " two ",
+		"other":    "not asked for",
+	}))
+
+	got, err := is.Markers("s-1", "marker_a", "marker_b", "marker_absent")
+	if err != nil {
+		t.Fatalf("Markers: %v", err)
+	}
+	if got.ID != "s-1" || got.Closed {
+		t.Errorf("Markers = id %q closed %v, want the open row s-1", got.ID, got.Closed)
+	}
+	want := map[string]string{"marker_a": "one", "marker_b": " two ", "marker_absent": ""}
+	if !reflect.DeepEqual(got.Values, want) {
+		t.Errorf("Markers values = %#v, want %#v", got.Values, want)
+	}
+	for _, op := range opsOf(rec.Calls()) {
+		if op != "Get" {
+			t.Errorf("Markers issued %q, want a single read and no write", op)
+		}
+	}
+}
+
+// TestMarkersReportsAClosedRow proves a closed session is still readable and is
+// reported as closed, so the caller decides what a closed row means.
+func TestMarkersReportsAClosedRow(t *testing.T) {
+	is, _ := recordingStore(t, sessionBeadFixture("s-1", "closed", map[string]string{"marker_a": "one"}))
+
+	got, err := is.Markers("s-1", "marker_a")
+	if err != nil {
+		t.Fatalf("Markers: %v", err)
+	}
+	if !got.Closed || got.Values["marker_a"] != "one" {
+		t.Errorf("Markers = closed %v values %#v, want the closed row's marker", got.Closed, got.Values)
+	}
+}
+
+// TestMarkersSharesGetsValidation proves Markers refuses what Get refuses: a
+// present bead that is not a session is ErrSessionNotFound, and an absent id is
+// the wrapped store not-found error.
+func TestMarkersSharesGetsValidation(t *testing.T) {
+	work := beads.Bead{ID: "w-1", Type: "task", Status: "open", Metadata: map[string]string{"marker_a": "one"}}
+	is, _ := recordingStore(t, work)
+
+	if _, err := is.Markers("w-1", "marker_a"); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("Markers on a work bead: err = %v, want ErrSessionNotFound", err)
+	}
+	if _, err := is.Markers("s-absent", "marker_a"); !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("Markers on an absent id: err = %v, want beads.ErrNotFound", err)
+	}
+}

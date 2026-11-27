@@ -361,6 +361,37 @@ func (s *Store) CurrentClaimBeadID(id string) (string, error) {
 	return strings.TrimSpace(b.Metadata[beadmeta.CurrentClaimBeadIDMetadataKey]), nil
 }
 
+// MarkerSnapshot is one validated read of a session row's marker keys: the
+// canonical id the read resolved, whether the row is closed, and the value of
+// each requested key ("" when the row does not carry it).
+type MarkerSnapshot struct {
+	ID     string
+	Closed bool
+	Values map[string]string
+}
+
+// Markers returns the requested session-attribute marker keys of the session
+// identified by id. It is the read half of SetMarker: the front door for a
+// caller that must compare marker keys before writing one, without holding the
+// raw bead.
+//
+// It shares Get's validation and error contract (both route through
+// validatedBead): the id is resolved EXACTLY, a present-but-non-session bead is
+// ErrSessionNotFound and an absent id is the wrapped store not-found error. A
+// closed row is returned and reported as closed; the caller decides what that
+// means. Values are verbatim, and only the requested keys are returned.
+func (s *Store) Markers(id string, keys ...string) (MarkerSnapshot, error) {
+	b, err := s.validatedBead(id)
+	if err != nil {
+		return MarkerSnapshot{}, err
+	}
+	values := make(map[string]string, len(keys))
+	for _, key := range keys {
+		values[key] = b.Metadata[key]
+	}
+	return MarkerSnapshot{ID: b.ID, Closed: b.Status == "closed", Values: values}, nil
+}
+
 // CloseWithoutReason closes the session bead identified by id without stamping
 // terminal close metadata. It is the front door for the raw store.Close(id)
 // call in closeBead, which stamps ClosePatch via setMetaBatch separately and

@@ -117,27 +117,35 @@ func hookMarkExecutionResumed(sessionID, instanceToken, beadID string) (bool, er
 // for the standing latch is not rewritten, because the claim door re-runs this
 // branch on every poll.
 //
-// The session's raw bead is read because session.Info does not carry the
-// backstop keys. The id is resolved EXACTLY and must name an open session bead,
-// for the reason SetCurrentClaim gives: bd's fuzzy id resolver would otherwise
-// let the write land on a prefix-colliding row.
+// The backstop keys are read through session.Store.Markers because session.Info
+// does not carry them. That read resolves the id EXACTLY and refuses a bead that
+// is not a session, for the reason SetCurrentClaim gives: bd's fuzzy id resolver
+// would otherwise let the write land on a prefix-colliding row. A closed row is
+// left alone.
 func markExecutionResumed(sessFront *session.Store, sessionID, instanceToken, beadID string, now time.Time) (bool, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	beadID = strings.TrimSpace(beadID)
 	if sessionID == "" || beadID == "" {
 		return false, nil
 	}
-	row, resolved, err := session.ResolveSessionBeadByExactID(sessFront.Store().Store, sessionID)
+	row, err := sessFront.Markers(sessionID,
+		"instance_token",
+		executionClaimNudgeStalledKey,
+		executionClaimNudgeStalledTokenKey,
+		executionClaimNudgeWorkKey,
+		executionClaimResumedKey,
+	)
 	if err != nil {
 		return false, err
 	}
-	if resolved != sessionID {
-		return false, fmt.Errorf("session id %q resolved to a different bead %q", sessionID, resolved)
+	if row.ID != sessionID {
+		return false, fmt.Errorf("session id %q resolved to a different bead %q", sessionID, row.ID)
 	}
-	if strings.EqualFold(strings.TrimSpace(row.Status), "closed") {
+	if row.Closed {
 		return false, nil
 	}
-	meta := row.Metadata
+	resolved := row.ID
+	meta := row.Values
 	rowToken := strings.TrimSpace(meta["instance_token"])
 	if strings.TrimSpace(meta[executionClaimNudgeStalledKey]) == "" ||
 		rowToken == "" ||
