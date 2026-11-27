@@ -1,9 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/session"
@@ -86,6 +88,81 @@ func hookSessionDrainPending(sessionID string) (bool, error) {
 		return false, err
 	}
 	return state == session.StateDraining, nil
+}
+
+// hookMarkExecutionResumed records, on the session identified by sessionID,
+// that the session answered its claim nudge for beadID after the execution
+// backstop gave up on it. It is the production implementation of the
+// hookClaimOps.MarkExecutionResumed seam and reports whether it wrote.
+//
+// The answer travels on the session row because the drain it answers lives in
+// the controller's memory and this process is the agent's: the controller reads
+// the marker back (cancelExecutionStalledDrainIfResumed) and cancels the drain
+// while it still can.
+func hookMarkExecutionResumed(sessionID, instanceToken, beadID string) (bool, error) {
+	sessFront, err := sessionCurrentClaimFrontDoor()
+	if err != nil {
+		return false, err
+	}
+	return markExecutionResumed(sessFront, sessionID, instanceToken, beadID, time.Now())
+}
+
+// markExecutionResumed is hookMarkExecutionResumed against an open front door.
+//
+// It writes executionClaimResumedKey only when the row carries an escalation
+// latch this call answers: the latch belongs to the row's current incarnation,
+// the caller is that incarnation (when its environment carries an instance
+// token at all), and the latched bead is beadID. Every other row, which is every
+// ordinary adoption, costs one read and no write. An answer already recorded
+// for the standing latch is not rewritten, because the claim door re-runs this
+// branch on every poll.
+//
+// The backstop keys are read through session.Store.Markers because session.Info
+// does not carry them. That read resolves the id EXACTLY and refuses a bead that
+// is not a session, for the reason SetCurrentClaim gives: bd's fuzzy id resolver
+// would otherwise let the write land on a prefix-colliding row. A closed row is
+// left alone.
+func markExecutionResumed(sessFront *session.Store, sessionID, instanceToken, beadID string, now time.Time) (bool, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	beadID = strings.TrimSpace(beadID)
+	if sessionID == "" || beadID == "" {
+		return false, nil
+	}
+	row, err := sessFront.Markers(sessionID,
+		"instance_token",
+		executionClaimNudgeStalledKey,
+		executionClaimNudgeStalledTokenKey,
+		executionClaimNudgeWorkKey,
+		executionClaimResumedKey,
+	)
+	if err != nil {
+		return false, err
+	}
+	if row.ID != sessionID {
+		return false, fmt.Errorf("session id %q resolved to a different bead %q", sessionID, row.ID)
+	}
+	if row.Closed {
+		return false, nil
+	}
+	resolved := row.ID
+	meta := row.Values
+	rowToken := strings.TrimSpace(meta["instance_token"])
+	if strings.TrimSpace(meta[executionClaimNudgeStalledKey]) == "" ||
+		rowToken == "" ||
+		strings.TrimSpace(meta[executionClaimNudgeStalledTokenKey]) != rowToken ||
+		strings.TrimSpace(meta[executionClaimNudgeWorkKey]) != beadID {
+		return false, nil
+	}
+	if callerToken := strings.TrimSpace(instanceToken); callerToken != "" && callerToken != rowToken {
+		return false, nil
+	}
+	if executionStalledDrainResumed(meta) {
+		return false, nil
+	}
+	if err := sessFront.SetMarker(resolved, executionClaimResumedKey, now.UTC().Format(time.RFC3339)); err != nil {
+		return false, fmt.Errorf("recording %s on session %q: %w", executionClaimResumedKey, resolved, err)
+	}
+	return true, nil
 }
 
 // hookResolveSessionWorkDir returns the checkout the session identified by

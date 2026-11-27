@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"log"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,9 @@ type stalledConvergenceHarness struct {
 	sessionID   string
 	sessionName string
 	work        beads.Bead
+	// controllerLog captures the process log, where the drain tracker's scan
+	// reports (it has no stdout of its own).
+	controllerLog bytes.Buffer
 }
 
 func newStalledConvergenceHarness(t *testing.T) *stalledConvergenceHarness {
@@ -57,6 +62,9 @@ func newStalledConvergenceHarness(t *testing.T) *stalledConvergenceHarness {
 		t.Fatalf("creating the pool session: %v", err)
 	}
 	h := &stalledConvergenceHarness{env: env, template: template, sessionID: info.ID, sessionName: info.SessionName}
+	previousLog := log.Writer()
+	log.SetOutput(&h.controllerLog)
+	t.Cleanup(func() { log.SetOutput(previousLog) })
 
 	if err := env.store.SetMetadataBatch(info.ID, map[string]string{
 		"pool_managed": "true",
@@ -318,5 +326,255 @@ func TestExecutionStalledDrainDoesNotStrandAMidDrainWake(t *testing.T) {
 	}
 	if strings.TrimSpace(reopened.Assignee) != "" {
 		t.Fatalf("the row is still assigned to a closed session (%q): stranded", reopened.Assignee)
+	}
+}
+
+// The answer: the one thing that cancels an execution-stalled drain.
+//
+// The backstop cannot tell a seat inside one long silent command from a seat
+// that claimed and went idle. When the first kind comes back and answers the
+// claim nudge for the bead it holds, the claim door records that on the session
+// row, and the controller cancels the drain while it still can: before the row
+// is marked stop-pending and the runtime is killed.
+
+// escalate runs the backstop to exhaustion and returns the latch time, after
+// confirming the escalation is the shape an answer can be matched against: a
+// tracked execution-stalled drain latched for the row's current incarnation.
+func (h *stalledConvergenceHarness) escalate(t *testing.T) time.Time {
+	t.Helper()
+	h.runBackstopToExhaustion(t)
+	ds := h.env.dt.get(h.sessionID)
+	if ds == nil || ds.reason != executionStalledDrainReason {
+		t.Fatalf("escalation precondition: tracked drain = %+v, want an execution-stalled drain", ds)
+	}
+	row := h.sessionBead(t)
+	token := strings.TrimSpace(row.Metadata["instance_token"])
+	if token == "" || strings.TrimSpace(row.Metadata[executionClaimNudgeStalledTokenKey]) != token {
+		t.Fatalf("escalation precondition: latch token %q, instance_token %q, want the same non-empty incarnation",
+			row.Metadata[executionClaimNudgeStalledTokenKey], token)
+	}
+	latchedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(row.Metadata[executionClaimNudgeStalledKey]))
+	if err != nil {
+		t.Fatalf("escalation precondition: latch time %q: %v", row.Metadata[executionClaimNudgeStalledKey], err)
+	}
+	return latchedAt
+}
+
+// answer records the seat's answer through the claim door's own writer, at.
+func (h *stalledConvergenceHarness) answer(t *testing.T, at time.Time) {
+	t.Helper()
+	token := strings.TrimSpace(h.sessionBead(t).Metadata["instance_token"])
+	wrote, err := markExecutionResumed(sessionFrontDoor(h.env.store), h.sessionID, token, h.work.ID, at)
+	if err != nil || !wrote {
+		t.Fatalf("recording the answer: wrote=%v err=%v, want the claim door to write it", wrote, err)
+	}
+}
+
+// tick runs one reconcile tick, with the provider-backed drain ops the
+// controller uses when withDrainOps is set, so the Phase-1 drain-ack arm sees
+// the reconciler's own acknowledgement.
+func (h *stalledConvergenceHarness) tick(t *testing.T, withDrainOps bool) {
+	t.Helper()
+	sessions, err := loadSessionBeads(h.env.store)
+	if err != nil {
+		t.Fatalf("loading session beads: %v", err)
+	}
+	if !withDrainOps {
+		h.env.reconcile(sessions)
+		return
+	}
+	h.env.reconcileWithPoolDesiredAndDrainOps(sessions, map[string]int{h.template: 1}, newDrainOps(h.env.sp))
+}
+
+func (h *stalledConvergenceHarness) runtimeMeta(t *testing.T, key string) string {
+	t.Helper()
+	value, err := h.env.sp.GetMeta(h.sessionName, key)
+	if err != nil {
+		t.Fatalf("reading runtime meta %s: %v", key, err)
+	}
+	return value
+}
+
+// assertDrainCanceled is the whole observable effect of an honored answer: no
+// tracked drain, no drain acknowledgement left for Phase 1 to act on, the
+// runtime still running under a row that never went draining, and the
+// backstop's state machine reset so a later real stall starts a fresh window.
+func (h *stalledConvergenceHarness) assertDrainCanceled(t *testing.T) {
+	t.Helper()
+	if ds := h.env.dt.get(h.sessionID); ds != nil {
+		t.Fatalf("tracked drain after the answer = %+v, want it canceled", ds)
+	}
+	for _, key := range []string{"GC_DRAIN_ACK", reconcilerDrainAckSourceKey, reconcilerDrainAckReasonKey, reconcilerDrainAckGenerationKey} {
+		if got := h.runtimeMeta(t, key); got != "" {
+			t.Fatalf("runtime meta %s after the answer = %q, want cleared", key, got)
+		}
+	}
+	if !h.env.sp.IsRunning(h.sessionName) {
+		t.Fatalf("the runtime was stopped although the seat answered; stdout=%s stderr=%s",
+			h.env.stdout.String(), h.env.stderr.String())
+	}
+	row := h.sessionBead(t)
+	if state := strings.TrimSpace(row.Metadata["state"]); state == string(sessionpkg.StateDraining) {
+		t.Fatalf("session state = %q, want the row never marked draining", state)
+	}
+	if strings.EqualFold(strings.TrimSpace(row.Status), "closed") {
+		t.Fatal("the session bead was closed although the seat answered")
+	}
+	for _, key := range []string{
+		executionClaimNudgeWorkKey, executionClaimNudgeCountKey, executionClaimNudgeAtKey,
+		executionClaimNudgeStalledKey, executionClaimNudgeStalledTokenKey, executionClaimResumedKey,
+	} {
+		if got := strings.TrimSpace(row.Metadata[key]); got != "" {
+			t.Fatalf("%s after the answer = %q, want the backstop state reset", key, got)
+		}
+	}
+	want := "execution-claim-nudge: " + h.sessionName + " answered for " + h.work.ID + "; canceled execution-stalled drain"
+	reported := h.env.stdout.String() + h.controllerLog.String()
+	if got := strings.Count(reported, want); got != 1 {
+		t.Fatalf("the cancel is reported %d times, want exactly once (%q); output=%s", got, want, reported)
+	}
+	claim, err := h.env.store.Get(h.work.ID)
+	if err != nil {
+		t.Fatalf("re-reading the claim: %v", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(claim.Status), "in_progress") || strings.TrimSpace(claim.Assignee) != h.sessionName {
+		t.Fatalf("claim = status %q assignee %q, want it still held by the answering seat", claim.Status, claim.Assignee)
+	}
+}
+
+// TestExecutionStalledDrainCanceledWhenTheSeatAnswers: the drain tracker
+// honors the answer at either cancelable stage, before the deferred drain
+// signal is set and after it. The seat keeps its session and its claim, and
+// stays up long after the drain would have timed out.
+func TestExecutionStalledDrainCanceledWhenTheSeatAnswers(t *testing.T) {
+	t.Run("before the drain signal is set", func(t *testing.T) {
+		h := newStalledConvergenceHarness(t)
+		latchedAt := h.escalate(t)
+		h.answer(t, latchedAt.Add(time.Minute))
+
+		h.tick(t, false)
+
+		h.assertDrainCanceled(t)
+	})
+
+	t.Run("after the drain signal is set", func(t *testing.T) {
+		h := newStalledConvergenceHarness(t)
+		latchedAt := h.escalate(t)
+		h.tick(t, false) // the tracker defers the signal one tick, then sets it
+		if ds := h.env.dt.get(h.sessionID); ds == nil || !ds.ackSet {
+			t.Fatalf("precondition: tracked drain = %+v, want the drain signal set", ds)
+		}
+		if got := h.runtimeMeta(t, "GC_DRAIN_ACK"); got != "1" {
+			t.Fatalf("precondition: GC_DRAIN_ACK = %q, want 1", got)
+		}
+		h.answer(t, latchedAt.Add(time.Minute))
+
+		h.tick(t, false)
+
+		h.assertDrainCanceled(t)
+	})
+
+	t.Run("the seat stays up past the drain timeout", func(t *testing.T) {
+		h := newStalledConvergenceHarness(t)
+		latchedAt := h.escalate(t)
+		h.answer(t, latchedAt.Add(time.Minute))
+		h.tick(t, false)
+
+		for i := 0; i < 3; i++ {
+			h.env.clk.Advance(defaultDrainTimeout + time.Minute)
+			h.tick(t, false)
+		}
+
+		h.assertDrainCanceled(t)
+	})
+}
+
+// TestExecutionStalledAckCanceledInPhaseOneWhenTheSeatAnswers: the last
+// cancelable moment. The drain signal is set and the Phase-1 drain-ack arm is
+// about to mark the row stop-pending and kill the runtime; an answer that
+// landed in between cancels the drain instead, and nothing is written to the
+// row's lifecycle.
+func TestExecutionStalledAckCanceledInPhaseOneWhenTheSeatAnswers(t *testing.T) {
+	t.Run("tracked drain", func(t *testing.T) {
+		h := newStalledConvergenceHarness(t)
+		latchedAt := h.escalate(t)
+		h.tick(t, true) // sets the drain signal; Phase 1 has not seen it yet
+		if got := h.runtimeMeta(t, "GC_DRAIN_ACK"); got != "1" {
+			t.Fatalf("precondition: GC_DRAIN_ACK = %q, want 1", got)
+		}
+		h.answer(t, latchedAt.Add(time.Minute))
+
+		h.tick(t, true)
+
+		h.assertDrainCanceled(t)
+		if got := strings.TrimSpace(h.sessionBead(t).Metadata["state_reason"]); got == "drain-ack-stop-pending" {
+			t.Fatalf("state_reason = %q, want no stop-pending write", got)
+		}
+	})
+
+	t.Run("the tracker entry did not survive a controller restart", func(t *testing.T) {
+		h := newStalledConvergenceHarness(t)
+		latchedAt := h.escalate(t)
+		h.tick(t, true)
+		h.env.dt = newDrainTracker() // the in-memory drain is gone; the signal on the runtime is not
+		h.answer(t, latchedAt.Add(time.Minute))
+
+		h.tick(t, true)
+
+		h.assertDrainCanceled(t)
+	})
+}
+
+// TestExecutionStalledDrainIgnoresAStaleAnswer: only the escalated incarnation
+// answering AFTER the escalation cancels the drain. An answer older than the
+// latch (it answered an earlier escalation) or a latch that belongs to another
+// incarnation leaves the drain exactly as it was: it reaches stop-pending and
+// the runtime is stopped.
+func TestExecutionStalledDrainIgnoresAStaleAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stale func(latchedAt time.Time) map[string]string
+	}{
+		{"an answer older than the latch", func(latchedAt time.Time) map[string]string {
+			return map[string]string{executionClaimResumedKey: latchedAt.Add(-time.Second).UTC().Format(time.RFC3339)}
+		}},
+		{"a latch for another incarnation", func(latchedAt time.Time) map[string]string {
+			return map[string]string{
+				executionClaimNudgeStalledTokenKey: "an-earlier-incarnation",
+				executionClaimResumedKey:           latchedAt.Add(time.Minute).UTC().Format(time.RFC3339),
+			}
+		}},
+		{"an unreadable answer", func(time.Time) map[string]string {
+			return map[string]string{executionClaimResumedKey: "soon"}
+		}},
+		{"no answer", func(time.Time) map[string]string { return nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newStalledConvergenceHarness(t)
+			latchedAt := h.escalate(t)
+			if meta := tc.stale(latchedAt); meta != nil {
+				if err := h.env.store.SetMetadataBatch(h.sessionID, meta); err != nil {
+					t.Fatalf("seeding the stale answer: %v", err)
+				}
+			}
+
+			h.tick(t, true) // sets the drain signal
+			if ds := h.env.dt.get(h.sessionID); ds == nil || !ds.ackSet {
+				t.Fatalf("tracked drain after the first tick = %+v, want it intact with the signal set", ds)
+			}
+			h.tick(t, true) // Phase 1 honors the signal
+
+			row := h.sessionBead(t)
+			if state := strings.TrimSpace(row.Metadata["state"]); state != string(sessionpkg.StateDraining) {
+				t.Fatalf("session state = %q, want %q: a stale answer must not cancel the drain; stdout=%s stderr=%s",
+					state, sessionpkg.StateDraining, h.env.stdout.String(), h.env.stderr.String())
+			}
+			if reported := h.env.stdout.String() + h.controllerLog.String(); strings.Contains(reported, "canceled execution-stalled drain") {
+				t.Fatalf("a cancel is reported for a stale answer: %s", reported)
+			}
+			if strings.TrimSpace(row.Metadata[executionClaimNudgeStalledKey]) == "" {
+				t.Fatal("the escalation latch was cleared although the drain was not canceled")
+			}
+		})
 	}
 }

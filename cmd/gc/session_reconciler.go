@@ -2833,6 +2833,17 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							continue
 						}
 					}
+					// The escalated seat answered for the bead it holds between
+					// the drain signal being set and this arm marking the row
+					// stop-pending. This is the last moment the drain can still
+					// be canceled: past here the runtime is killed.
+					if alive && reconcilerOwnedAck && ackReason == executionStalledDrainReason &&
+						cancelExecutionStalledDrainIfResumed(infoByID[id], store, sp, dt, dops, stdout) {
+						if trace != nil {
+							trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ackReason), TraceOutcomeCancel, tp.TemplateName, name, nil)
+						}
+						continue
+					}
 					configDriftAck := reconcilerOwnedAck && ackReason == "config-drift"
 					if !configDriftAck && dt != nil {
 						if ds := dt.get(id); ds != nil && ds.ackSet && ds.reason == "config-drift" {

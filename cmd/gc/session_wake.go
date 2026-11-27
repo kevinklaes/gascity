@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -248,6 +249,65 @@ const executionStalledDrainReason = "execution-stalled"
 func drainReasonCancelable(reason string) bool {
 	return reason != "config-drift" && reason != "orphaned" && reason != "suspended" &&
 		reason != executionStalledDrainReason
+}
+
+// cancelExecutionStalledDrainIfResumed cancels an execution-stalled drain
+// whose escalated incarnation has answered (executionStalledDrainResumed),
+// while the drain is still cancelable: tracked in memory, or left as a
+// reconciler-owned ack on a live runtime whose row is not yet stop-pending. It
+// clears every execution-backstop key, the tracker entry and the reconciler
+// drain ack, so a later real stall starts a fresh window, and logs one line.
+//
+// This is the only cancel an execution-stalled drain has. The keep-alive
+// lenses cannot cancel it, because the claim that would trigger them is the
+// claim that justified the drain; the answer is different evidence: the seat
+// itself came back and asked for the very bead the backstop escalated.
+//
+// It reads the session's raw metadata with one store.Get, because
+// sessions.Info does not carry the backstop keys; callers invoke it only for
+// an execution-stalled drain, which is already rare. A failed read, a marker
+// that does not hold, or a backstop state that cannot be cleared changes
+// nothing: the drain proceeds as if no answer had been given.
+func cancelExecutionStalledDrainIfResumed(info sessions.Info, store beads.Store, sp runtime.Provider, dt *drainTracker, dops drainOps, stdout io.Writer) bool {
+	if store == nil {
+		return false
+	}
+	name := info.SessionNameMetadata
+	var tracked *drainState
+	if dt != nil {
+		tracked = dt.get(info.ID)
+	}
+	if tracked != nil {
+		gen, _ := strconv.Atoi(info.Generation)
+		if tracked.reason != executionStalledDrainReason || gen != tracked.generation {
+			return false
+		}
+	} else if reason, ok := reconcilerDrainAckMatchesSessionInfo(info, sp, name); !ok || reason != executionStalledDrainReason {
+		return false
+	}
+	row, err := store.Get(info.ID)
+	if err != nil || row.ID != info.ID || !executionStalledDrainResumed(row.Metadata) {
+		return false
+	}
+	beadID := strings.TrimSpace(row.Metadata[executionClaimNudgeWorkKey])
+	// Reset the backstop FIRST. It is the one step that can fail, and a drain
+	// canceled under a latch that is still set would silence the backstop for
+	// this seat until the latch aged out.
+	clearExecutionClaimMarker(store, &row, stdout)
+	if row.Metadata[executionClaimNudgeStalledKey] != "" {
+		return false
+	}
+	if tracked == nil || !cancelSessionDrainIfInfo(info, sp, dt, func(reason string) bool {
+		return reason == executionStalledDrainReason
+	}) {
+		_ = clearReconcilerDrainAckMetadata(sp, name)
+		telemetry.RecordDrainTransition(context.Background(), name, executionStalledDrainReason, "cancel")
+	}
+	if dops != nil {
+		_ = dops.clearDrain(name)
+	}
+	fmt.Fprintf(stdout, "execution-claim-nudge: %s answered for %s; canceled execution-stalled drain\n", name, beadID) //nolint:errcheck // best-effort
+	return true
 }
 
 func pendingDrainReasonCancelable(reason string) bool {
@@ -661,6 +721,17 @@ func advanceSessionDrainsWithSessionsTraced(
 				trace.RecordDecision(TraceSiteDrainComplete, TraceReasonCode(ds.reason), TraceOutcomeComplete, normalizedSessionTemplateInfo(info, cfg), name, traceRecordPayload{
 					"drain_started_at": ds.startedAt,
 				})
+			}
+			continue
+		}
+
+		// The escalated seat answered for the bead it holds: the one thing that
+		// cancels an execution-stalled drain. The line goes to the controller
+		// log, the only writer this scan has.
+		if ds.reason == executionStalledDrainReason &&
+			cancelExecutionStalledDrainIfResumed(info, store, sp, dt, nil, log.Writer()) {
+			if trace != nil {
+				trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ds.reason), TraceOutcomeCancel, normalizedSessionTemplateInfo(info, cfg), name, nil)
 			}
 			continue
 		}

@@ -287,6 +287,11 @@ type hookClaimOps struct {
 	// restampHookAdoption). Only a CAS may back it: a lost CAS is how the
 	// caller learns someone else took the bead.
 	RestampAdopted hookClaimRestampFunc
+	// MarkExecutionResumed records on the CLAIMING SESSION's own bead that it
+	// answered for a bead the execution backstop had given up on, and reports
+	// whether the row carried such an escalation. Best-effort; consulted only
+	// when the session adopts work it already holds.
+	MarkExecutionResumed hookMarkExecutionResumedFunc
 }
 
 type (
@@ -311,6 +316,10 @@ type (
 	// it still carries fromAssignee, reporting whether it now carries
 	// toAssignee.
 	hookClaimRestampFunc func(context.Context, string, []string, string, string, string) (bool, error)
+	// hookMarkExecutionResumedFunc (sessionID, instanceToken, beadID) records
+	// that the session answered an execution-stalled escalation for beadID,
+	// reporting whether it wrote the answer.
+	hookMarkExecutionResumedFunc func(sessionID, instanceToken, beadID string) (bool, error)
 )
 
 type hookClaimJSONResult struct {
@@ -479,6 +488,7 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 			if restamped, adopt := restampHookAdoption(bead, canonicalAssignee, verdict, *opts, *ops, dir, stderr); adopt {
 				bead = restamped
 				result.Assignee = restamped.Assignee
+				recordHookExecutionStalledAnswer(bead, *opts, *ops, stderr)
 				// minted=false: adoption returns work this session already owned.
 				return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, bead, *opts, *ops, dir, false, stdout, stderr)}
 			}
@@ -568,6 +578,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.RestampAdopted == nil {
 		ops.RestampAdopted = hookClaimRestampWithBdStore
+	}
+	if ops.MarkExecutionResumed == nil {
+		ops.MarkExecutionResumed = hookMarkExecutionResumed
 	}
 	if ops.EmitHookClaimReclaimedStale == nil {
 		ops.EmitHookClaimReclaimedStale = hookEmitClaimReclaimedStale
@@ -2222,6 +2235,34 @@ func stampHookSessionCurrentClaim(bead beads.Bead, opts hookClaimOptions, ops ho
 	}
 	if err := ops.StampSessionClaim(sessionID, beadID); err != nil {
 		fmt.Fprintf(stderr, "gc hook --claim: recording current claim %s on session %s: %v\n", beadID, sessionID, err) //nolint:errcheck
+	}
+}
+
+// recordHookExecutionStalledAnswer tells the controller that this session is
+// alive and holds bead, in case the execution backstop already gave up on it.
+//
+// The backstop cannot tell a seat inside one long silent command from a seat
+// that claimed and went idle: both hold a claim behind a quiet pane. When the
+// first kind comes back and answers the queued claim nudge, adopting the bead
+// it holds IS the answer, so the adoption branch records it on the session row
+// (ops.MarkExecutionResumed) for the controller to cancel a drain that is
+// still cancelable. Only adoption calls this: claiming new work says nothing
+// about the escalated claim, and a `draining` row never reaches adoption (F-D).
+//
+// Best-effort, like the other session-row stamps: a failure is reported on
+// stderr and never fails the claim. It never touches --drain-ack.
+func recordHookExecutionStalledAnswer(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, stderr io.Writer) {
+	sessionID := hookClaimSessionID(opts.Env)
+	beadID := strings.TrimSpace(bead.ID)
+	if sessionID == "" || beadID == "" || ops.MarkExecutionResumed == nil {
+		return
+	}
+	answered, err := ops.MarkExecutionResumed(sessionID, hookClaimEnvValue(opts.Env, "GC_INSTANCE_TOKEN"), beadID)
+	switch {
+	case err != nil:
+		fmt.Fprintf(stderr, "gc hook --claim: recording execution-stalled answer for %s failed: %v\n", sessionID, err) //nolint:errcheck
+	case answered:
+		fmt.Fprintf(stderr, "gc hook --claim: %s answered the execution-stalled drain for %s; asked the controller to cancel it\n", sessionID, beadID) //nolint:errcheck
 	}
 }
 

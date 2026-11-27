@@ -381,3 +381,199 @@ func TestHookClaimDrainPendingSkipsWhenNoSessionIDIsKeyed(t *testing.T) {
 		t.Fatalf("claim mutations = %q, want work-1", got)
 	}
 }
+
+// executionAnswerMark records what the claim door asked the session row to
+// record as an answer to an execution-stalled drain, and answers with a fixed
+// verdict: wrote says the row carried a latch this call answers.
+type executionAnswerMark struct {
+	calls [][3]string
+	wrote bool
+	err   error
+}
+
+func (m *executionAnswerMark) mark(sessionID, instanceToken, beadID string) (bool, error) {
+	m.calls = append(m.calls, [3]string{sessionID, instanceToken, beadID})
+	return m.wrote, m.err
+}
+
+const executionAnswerTestInstanceToken = "incarnation-1"
+
+// heldClaimOps is a claim by a seat that already HOLDS work-1 in progress: the
+// shape of a worker that comes back from a long silent command and answers the
+// queued claim nudge. Every stamp seam is inert so the test observes only the
+// adoption and the answer.
+func (e *drainPendingClaimEnv) heldClaimOps(mark *executionAnswerMark) hookClaimOps {
+	ops := e.ops()
+	ops.Runner = func(string, string) (string, error) {
+		e.queries++
+		return `[{"id":"work-1","status":"in_progress","assignee":"worker-1","metadata":{"gc.routed_to":"worker"}}]`, nil
+	}
+	ops.ReadWorkMeta = func(_ context.Context, _ string, _ []string, beadID, _ string) (beads.Bead, error) {
+		return beads.Bead{ID: beadID, Status: "in_progress", Assignee: "worker-1"}, nil
+	}
+	ops.StampWorkMeta = func(context.Context, string, []string, string, string, map[string]string) error {
+		return nil
+	}
+	ops.StampSessionClaim = func(string, string) error { return nil }
+	ops.PublishRunMap = func(string, string, ...string) error { return nil }
+	ops.EmitExecutionStepStarted = func(beads.Bead, string, []string, string) {}
+	ops.MarkExecutionResumed = mark.mark
+	return ops
+}
+
+// heldClaimOpts is the claim a pool worker's own incarnation makes: with
+// --drain-ack, as every worker claim command passes it.
+func (e *drainPendingClaimEnv) heldClaimOpts() hookClaimOptions {
+	opts := e.opts(true)
+	opts.IdentityCandidates = []string{"worker-1"}
+	opts.Env = append(opts.Env, "GC_INSTANCE_TOKEN="+executionAnswerTestInstanceToken)
+	return opts
+}
+
+// TestHookClaimAdoptionAfterExecutionStallRecordsTheAnswer: the execution
+// backstop gave up on a seat whose pane was quiet and requested its drain, but
+// the row is not stop-pending yet. The seat answers the claim nudge for the
+// bead it holds. It gets its assignment back, the drain is NOT acknowledged
+// (the seat is alive and working), and the answer is recorded for the
+// controller to cancel the drain.
+func TestHookClaimAdoptionAfterExecutionStallRecordsTheAnswer(t *testing.T) {
+	e := newDrainPendingClaimEnv()
+	mark := &executionAnswerMark{wrote: true}
+
+	code := doHookClaim("query", "/rig", e.heldClaimOpts(), e.heldClaimOps(mark), &e.stdout, &e.stderr)
+
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; stderr=%s", code, e.stderr.String())
+	}
+	result := e.result(t)
+	if result.Action != "work" || result.Reason != "existing_assignment" || result.BeadID != "work-1" {
+		t.Fatalf("result = %+v, want action=work reason=existing_assignment for work-1", result)
+	}
+	if result.DrainAcknowledged || e.drainAcked {
+		t.Errorf("drain acknowledged (result=%v, op=%v); an answering seat must keep its session", result.DrainAcknowledged, e.drainAcked)
+	}
+	if len(e.claimed) != 0 {
+		t.Errorf("claim mutations = %v, want none: adoption mints nothing", e.claimed)
+	}
+	want := [3]string{drainPendingTestSessionID, executionAnswerTestInstanceToken, "work-1"}
+	if len(mark.calls) != 1 || mark.calls[0] != want {
+		t.Fatalf("answer marks = %v, want exactly %v", mark.calls, want)
+	}
+	if !strings.Contains(e.stderr.String(), "answered the execution-stalled drain for work-1") {
+		t.Errorf("stderr = %q, want the answer named", e.stderr.String())
+	}
+}
+
+// TestHookClaimAdoptionWithoutALatchWritesNothing: an ordinary adoption, with
+// no escalation to answer, consults the row once, writes nothing and says
+// nothing about a drain.
+func TestHookClaimAdoptionWithoutALatchWritesNothing(t *testing.T) {
+	e := newDrainPendingClaimEnv()
+	mark := &executionAnswerMark{wrote: false}
+
+	code := doHookClaim("query", "/rig", e.heldClaimOpts(), e.heldClaimOps(mark), &e.stdout, &e.stderr)
+
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; stderr=%s", code, e.stderr.String())
+	}
+	if result := e.result(t); result.Action != "work" || result.Reason != "existing_assignment" {
+		t.Fatalf("result = %+v, want the adoption receipt", result)
+	}
+	if len(mark.calls) != 1 {
+		t.Fatalf("answer marks = %v, want the row consulted exactly once", mark.calls)
+	}
+	if strings.Contains(e.stderr.String(), "execution-stalled") {
+		t.Errorf("stderr = %q, want no execution-stalled line for an ordinary adoption", e.stderr.String())
+	}
+	if e.drainAcked {
+		t.Error("drain acknowledged on an ordinary adoption")
+	}
+}
+
+// TestHookClaimAdoptionSurvivesAFailedExecutionAnswer: recording the answer is
+// best-effort. A row that cannot be read or written costs the seat nothing but
+// a named fault; it still gets the work it holds.
+func TestHookClaimAdoptionSurvivesAFailedExecutionAnswer(t *testing.T) {
+	e := newDrainPendingClaimEnv()
+	mark := &executionAnswerMark{err: errors.New("session store unavailable")}
+
+	code := doHookClaim("query", "/rig", e.heldClaimOpts(), e.heldClaimOps(mark), &e.stdout, &e.stderr)
+
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; stderr=%s", code, e.stderr.String())
+	}
+	if result := e.result(t); result.Action != "work" || result.Reason != "existing_assignment" {
+		t.Fatalf("result = %+v, want the adoption receipt despite the failed answer", result)
+	}
+	if !strings.Contains(e.stderr.String(), "recording execution-stalled answer for "+drainPendingTestSessionID+" failed") ||
+		!strings.Contains(e.stderr.String(), "session store unavailable") {
+		t.Errorf("stderr = %q, want the fault named", e.stderr.String())
+	}
+	if e.drainAcked {
+		t.Error("drain acknowledged after a failed answer")
+	}
+}
+
+// TestHookClaimNewClaimNeverRecordsAnExecutionAnswer: only adopting the bead
+// the seat already holds can answer an execution-stalled drain. Claiming NEW
+// work says nothing about the claim the backstop escalated.
+func TestHookClaimNewClaimNeverRecordsAnExecutionAnswer(t *testing.T) {
+	e := newDrainPendingClaimEnv()
+	mark := &executionAnswerMark{wrote: true}
+	ops := e.ops()
+	ops.StampWorkMeta = func(context.Context, string, []string, string, string, map[string]string) error {
+		return nil
+	}
+	ops.StampSessionClaim = func(string, string) error { return nil }
+	ops.PublishRunMap = func(string, string, ...string) error { return nil }
+	ops.ReadWorkMeta = func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, error) {
+		return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee}, nil
+	}
+	ops.EmitExecutionStepStarted = func(beads.Bead, string, []string, string) {}
+	ops.MarkExecutionResumed = mark.mark
+
+	code := doHookClaim("query", "/rig", e.heldClaimOpts(), ops, &e.stdout, &e.stderr)
+
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; stderr=%s", code, e.stderr.String())
+	}
+	if got := strings.Join(e.claimed, ","); got != "work-1" {
+		t.Fatalf("claim mutations = %q, want work-1", got)
+	}
+	if result := e.result(t); result.Action != "work" || result.Reason == "existing_assignment" {
+		t.Fatalf("result = %+v, want a freshly claimed work result", result)
+	}
+	if len(mark.calls) != 0 {
+		t.Fatalf("answer marks = %v, want none for a new claim", mark.calls)
+	}
+}
+
+// TestHookClaimRefusesAnExecutionStalledDrainingRow: once the row says
+// `draining` the controller has committed to the stop and is already killing
+// the runtime, so no answer can rescue it, whatever requested the drain. The
+// fence refuses exactly as it does for every other drain reason: no query, no
+// adoption, the drain acknowledged, and no answer recorded.
+func TestHookClaimRefusesAnExecutionStalledDrainingRow(t *testing.T) {
+	e := newDrainPendingClaimEnv()
+	e.probe.pending = true
+	mark := &executionAnswerMark{wrote: true}
+
+	code := doHookClaim("query", "/rig", e.heldClaimOpts(), e.heldClaimOps(mark), &e.stdout, &e.stderr)
+
+	if code != 0 {
+		t.Fatalf("code = %d, want 0 (drain acknowledged); stderr=%s", code, e.stderr.String())
+	}
+	if e.queries != 0 {
+		t.Errorf("work query ran %d times; adoption must not outrun the drain fence", e.queries)
+	}
+	result := e.result(t)
+	if result.Action != "drain" || result.Reason != hookClaimReasonDrainPending {
+		t.Fatalf("result = %+v, want the drain refusal, not an adopted assignment", result)
+	}
+	if !e.drainAcked || !result.DrainAcknowledged {
+		t.Errorf("drain acknowledged = (op=%v, result=%v), want both: the refusal consumes --drain-ack", e.drainAcked, result.DrainAcknowledged)
+	}
+	if len(mark.calls) != 0 {
+		t.Fatalf("answer marks = %v, want none from a draining row", mark.calls)
+	}
+}

@@ -91,6 +91,12 @@ const (
 	// is written only when the reason changes and cleared once the backstop can
 	// act again or the claim is gone.
 	executionClaimHoldKey = "execution_claim_hold"
+	// executionClaimResumedKey is the RFC3339 time the escalated incarnation
+	// answered its claim nudge for the latched bead. The claim door writes it
+	// (hookMarkExecutionResumed) and the controller reads it to cancel an
+	// execution-stalled drain that is still cancelable
+	// (cancelExecutionStalledDrainIfResumed).
+	executionClaimResumedKey = "execution_claim_resumed"
 )
 
 // Execution-backstop hold reasons recorded in executionClaimHoldKey, alongside
@@ -98,6 +104,10 @@ const (
 const (
 	executionHoldMultiClaim = "multi_claim"
 	executionHoldNotQuiet   = "not_quiet"
+	// executionHoldHeartbeat names a seat that called `gc runtime heartbeat`:
+	// its held_until is still in the future, so a silent pane is a declared
+	// long operation rather than a stalled claim.
+	executionHoldHeartbeat = "heartbeat"
 )
 
 // executionStalledLatchRetryAfter bounds how long a latch silences
@@ -238,7 +248,8 @@ func (p poolExecutionBackstop) governs(s beads.Bead) bool {
 
 // resolve reports an outstanding stall only when all of it holds: the session
 // holds exactly ONE in-progress claim under a current identity, and the runtime
-// says the session has been quiet for at least the grace window.
+// says the session has been quiet for at least the grace window with no
+// heartbeat hold in force (held_until).
 //
 // Exactly one, because the pacing state names a single bead: a session juggling
 // several claims is demonstrably doing something, and picking one of them to
@@ -257,6 +268,15 @@ func (p poolExecutionBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, se
 		p.observeHold(p.store, &s, executionHoldMultiClaim, p.stdout)
 		return backstopTarget{}, backstopResolutionHold
 	}
+	// A seat that called `gc runtime heartbeat` declared a long silent
+	// operation, the same declaration that defers the reconciler's idle and
+	// max-age timers. Like every hold here it skips the tick and leaves the
+	// pacing state alone, so a hold that lapses with the seat still quiet
+	// resumes the escalation instead of restarting the grace window.
+	if executionHeartbeatHeld(s.Metadata, p.now) {
+		p.observeHold(p.store, &s, executionHoldHeartbeat, p.stdout)
+		return backstopTarget{}, backstopResolutionHold
+	}
 	if !p.sessionIsQuiet(sessName) {
 		p.observeHold(p.store, &s, executionHoldNotQuiet, p.stdout)
 		return backstopTarget{}, backstopResolutionHold
@@ -269,6 +289,21 @@ func (p poolExecutionBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, se
 		Assignee: claim.Assignee,
 		Store:    claim.Store,
 	}, backstopResolutionOutstanding
+}
+
+// executionHeartbeatHeld reports a live agent heartbeat hold: held_until in
+// the future and within one heartbeat's horizon (maximumHeartbeatDuration
+// plus an hour of skew), under no sleep_intent. A suspend's indefinite hold,
+// or an unparseable or empty deadline, is not one.
+func executionHeartbeatHeld(meta map[string]string, now time.Time) bool {
+	if strings.TrimSpace(meta["sleep_intent"]) != "" {
+		return false
+	}
+	until, err := time.Parse(time.RFC3339, strings.TrimSpace(meta["held_until"]))
+	if err != nil {
+		return false
+	}
+	return until.After(now) && !until.After(now.Add(maximumHeartbeatDuration+time.Hour))
 }
 
 // sessionIsQuiet reports whether the runtime has observed no activity for at
@@ -374,6 +409,28 @@ func (p poolExecutionBackstop) stalledLatchHolds(s *beads.Bead) bool {
 	return p.now.Sub(ts) < executionStalledLatchRetryAfter
 }
 
+// executionStalledDrainResumed reports that the incarnation the backstop
+// escalated has since answered for the very bead it latched: the latch and
+// its token are set, the token is the row's current instance_token, and the
+// resume time is not before the latch time. A re-escalation rewrites the
+// latch with a later time, so an old answer can never cancel a newer drain.
+// An unparseable latch or resume time is not an answer: the drain proceeds.
+func executionStalledDrainResumed(meta map[string]string) bool {
+	token := strings.TrimSpace(meta[executionClaimNudgeStalledTokenKey])
+	if token == "" || token != strings.TrimSpace(meta["instance_token"]) {
+		return false
+	}
+	latchedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(meta[executionClaimNudgeStalledKey]))
+	if err != nil {
+		return false
+	}
+	resumedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(meta[executionClaimResumedKey]))
+	if err != nil {
+		return false
+	}
+	return !resumedAt.Before(latchedAt)
+}
+
 // exhausted turns a spent attempt budget into one observable fact and one drain
 // request, latched so both happen exactly once per claim and incarnation
 // however many ticks the session survives. A latch from an earlier incarnation,
@@ -459,7 +516,7 @@ func writeExecutionClaimMarker(store beads.Store, s *beads.Bead, target backstop
 }
 
 // clearExecutionClaimMarker wipes the state machine — including the escalation
-// latch and the hold breadcrumb — so the next claim this slot takes starts a
+// latch, its answer and the hold breadcrumb — so the next claim this slot takes starts a
 // fresh window. No-op when there is nothing to clear, so steady-state ticks
 // stay write-free.
 func clearExecutionClaimMarker(store beads.Store, s *beads.Bead, stdout io.Writer) {
@@ -472,6 +529,7 @@ func clearExecutionClaimMarker(store beads.Store, s *beads.Bead, stdout io.Write
 		executionClaimNudgeStalledKey,
 		executionClaimNudgeStalledTokenKey,
 		executionClaimHoldKey,
+		executionClaimResumedKey,
 	}
 	dirty := false
 	for _, key := range keys {
