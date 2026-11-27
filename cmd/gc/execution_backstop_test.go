@@ -901,3 +901,67 @@ func TestExecutionHeartbeatHeldRules(t *testing.T) {
 		})
 	}
 }
+
+// TestExecutionStalledDrainResumedRules pins what counts as the escalated
+// incarnation answering: the latch and its token are set, the token is the
+// row's current instance_token, and the answer is not older than the latch.
+func TestExecutionStalledDrainResumedRules(t *testing.T) {
+	latch := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return latch.Add(d).Format(time.RFC3339) }
+	answered := func(overrides map[string]string) map[string]string {
+		meta := map[string]string{
+			"instance_token":                   "incarnation-1",
+			executionClaimNudgeStalledKey:      at(0),
+			executionClaimNudgeStalledTokenKey: "incarnation-1",
+			executionClaimResumedKey:           at(time.Minute),
+		}
+		for k, v := range overrides {
+			meta[k] = v
+		}
+		return meta
+	}
+	for _, tc := range []struct {
+		name string
+		meta map[string]string
+		want bool
+	}{
+		{"nil metadata", nil, false},
+		{"answered after the latch", answered(nil), true},
+		{"answered in the same second as the latch", answered(map[string]string{executionClaimResumedKey: at(0)}), true},
+		{"surrounding space", answered(map[string]string{executionClaimResumedKey: " " + at(time.Minute) + " "}), true},
+		{"no latch", answered(map[string]string{executionClaimNudgeStalledKey: ""}), false},
+		{"no latch token", answered(map[string]string{executionClaimNudgeStalledTokenKey: "", "instance_token": ""}), false},
+		{"latch for an earlier incarnation", answered(map[string]string{"instance_token": "incarnation-2"}), false},
+		{"no answer", answered(map[string]string{executionClaimResumedKey: ""}), false},
+		{"answer older than the latch", answered(map[string]string{executionClaimResumedKey: at(-time.Second)}), false},
+		{"unparseable latch", answered(map[string]string{executionClaimNudgeStalledKey: "soon"}), false},
+		{"unparseable answer", answered(map[string]string{executionClaimResumedKey: "soon"}), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := executionStalledDrainResumed(tc.meta); got != tc.want {
+				t.Fatalf("executionStalledDrainResumed(%v) = %v, want %v", tc.meta, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExecutionBackstopClearsTheAnswerWithTheClaim: the answer marker belongs
+// to one latched claim, so it is wiped with the rest of the state machine and
+// can never be read against the next claim this seat takes.
+func TestExecutionBackstopClearsTheAnswerWithTheClaim(t *testing.T) {
+	f := newExecutionBackstopFixture(t)
+	f.setInstanceToken(t, "incarnation-1")
+	driveToEscalation(t, f)
+	f.setSessionMeta(t, map[string]string{executionClaimResumedKey: f.now.UTC().Format(time.RFC3339)})
+
+	closed := "closed"
+	if err := f.store.Update(f.work.ID, beads.UpdateOpts{Status: &closed}); err != nil {
+		t.Fatalf("closing the claim: %v", err)
+	}
+	f.now = f.now.Add(time.Minute)
+	f.tick(t)
+
+	if got := f.sessionMeta(t, executionClaimResumedKey); got != "" {
+		t.Fatalf("%s after the claim completed = %q, want cleared", executionClaimResumedKey, got)
+	}
+}

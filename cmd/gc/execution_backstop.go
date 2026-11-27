@@ -91,6 +91,12 @@ const (
 	// is written only when the reason changes and cleared once the backstop can
 	// act again or the claim is gone.
 	executionClaimHoldKey = "execution_claim_hold"
+	// executionClaimResumedKey is the RFC3339 time the escalated incarnation
+	// answered its claim nudge for the latched bead. The claim door writes it
+	// (hookMarkExecutionResumed) and the controller reads it to cancel an
+	// execution-stalled drain that is still cancelable
+	// (cancelExecutionStalledDrainIfResumed).
+	executionClaimResumedKey = "execution_claim_resumed"
 )
 
 // Execution-backstop hold reasons recorded in executionClaimHoldKey, alongside
@@ -403,6 +409,28 @@ func (p poolExecutionBackstop) stalledLatchHolds(s *beads.Bead) bool {
 	return p.now.Sub(ts) < executionStalledLatchRetryAfter
 }
 
+// executionStalledDrainResumed reports that the incarnation the backstop
+// escalated has since answered for the very bead it latched: the latch and
+// its token are set, the token is the row's current instance_token, and the
+// resume time is not before the latch time. A re-escalation rewrites the
+// latch with a later time, so an old answer can never cancel a newer drain.
+// An unparseable latch or resume time is not an answer: the drain proceeds.
+func executionStalledDrainResumed(meta map[string]string) bool {
+	token := strings.TrimSpace(meta[executionClaimNudgeStalledTokenKey])
+	if token == "" || token != strings.TrimSpace(meta["instance_token"]) {
+		return false
+	}
+	latchedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(meta[executionClaimNudgeStalledKey]))
+	if err != nil {
+		return false
+	}
+	resumedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(meta[executionClaimResumedKey]))
+	if err != nil {
+		return false
+	}
+	return !resumedAt.Before(latchedAt)
+}
+
 // exhausted turns a spent attempt budget into one observable fact and one drain
 // request, latched so both happen exactly once per claim and incarnation
 // however many ticks the session survives. A latch from an earlier incarnation,
@@ -488,7 +516,7 @@ func writeExecutionClaimMarker(store beads.Store, s *beads.Bead, target backstop
 }
 
 // clearExecutionClaimMarker wipes the state machine — including the escalation
-// latch and the hold breadcrumb — so the next claim this slot takes starts a
+// latch, its answer and the hold breadcrumb — so the next claim this slot takes starts a
 // fresh window. No-op when there is nothing to clear, so steady-state ticks
 // stay write-free.
 func clearExecutionClaimMarker(store beads.Store, s *beads.Bead, stdout io.Writer) {
@@ -501,6 +529,7 @@ func clearExecutionClaimMarker(store beads.Store, s *beads.Bead, stdout io.Write
 		executionClaimNudgeStalledKey,
 		executionClaimNudgeStalledTokenKey,
 		executionClaimHoldKey,
+		executionClaimResumedKey,
 	}
 	dirty := false
 	for _, key := range keys {
