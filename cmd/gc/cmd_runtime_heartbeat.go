@@ -69,6 +69,16 @@ The hold is automatically cleared by the reconciler once held_until passes.
 This is the agent-facing API for the held_until bead-metadata mechanism; it
 does not put the session into a suspended state or change its sleep_intent.
 
+The hold also pauses the execution-stalled backstop: the claim
+nudge-then-drain escalation for a pool session that holds a claim behind a
+quiet pane. While the hold is in force the backstop neither nudges nor
+drains; when the hold lapses with the session still quiet, the escalation
+resumes from its persisted attempt count. Call this before a long silent
+command and call it again before the hold lapses if the command is still
+running. Renewing the claimed bead's lease is a separate call,
+"gc bd heartbeat <id>": it keeps the lease alive but does not pause the
+backstop, so a long silent command needs both.
+
 The default duration (` + defaultHeartbeatDuration.String() + `) covers long-running operations.
 Pass --duration to override.`,
 		Args: cobra.NoArgs,
@@ -162,6 +172,6 @@ func doRuntimeHeartbeat(store beads.Store, duration time.Duration, display, sess
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "Heartbeat set: idle-timeout suppressed until %s\n", heldUntil) //nolint:errcheck
+	fmt.Fprintf(stdout, "Heartbeat set: idle-timeout and execution backstop suppressed until %s\n", heldUntil) //nolint:errcheck
 	return 0
 }

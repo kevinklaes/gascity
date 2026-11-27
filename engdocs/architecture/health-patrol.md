@@ -392,6 +392,34 @@ stubbed `ExecRunner`) with no external infrastructure dependencies. See
   tracking. In that case, idle detection silently does nothing (no
   false positives, but also no idle kills).
 
+- **A heartbeat outranks a quiet pane**: `gc runtime heartbeat` sets
+  `held_until` on the session bead, and while that hold is in force (a
+  deadline in the future and inside the heartbeat horizon, with no
+  `sleep_intent` set) neither the idle timeout nor the execution-stalled
+  backstop (the claim nudge-then-drain escalation for a pool slot that
+  holds a claim) acts on the session. An agent about to run a long silent
+  command should call the heartbeat first, and call it again before the
+  hold lapses, rather than rely on pane output to keep `GetLastActivity()`
+  fresh. A hold that lapses with the session still quiet resumes the
+  escalation from its persisted attempt count; it does not restart the
+  grace window. The backstop does not consult the claimed bead's lease:
+  `gc bd heartbeat <id>` renews the lease and `gc runtime heartbeat`
+  pauses the backstop, so a long silent command needs both.
+
+- **An answer cancels an execution-stalled drain that is not yet
+  stop-pending**: when the incarnation the backstop escalated runs its
+  claim command and adopts the very bead the backstop latched, the claim
+  door records the answer on the session bead
+  (`execution_claim_resumed`). The controller honors it while the drain
+  is still cancelable (tracked in memory, or acknowledged by the
+  reconciler on a live runtime whose row is not yet
+  `drain-ack-stop-pending`): it cancels the drain and resets the
+  backstop's state, so a later real stall starts a fresh window. That
+  window is one to two controller ticks. Once the row is stop-pending the
+  runtime is being stopped and the claim door refuses as for any other
+  drain, so the heartbeat hold, not the answer, is what protects a long
+  silent command.
+
 - **Order dispatch goroutines are drained on controller exit**:
   Each due order launches a goroutine whose completion is tracked
   by an in-flight counter and channel signal. Controller shutdown
